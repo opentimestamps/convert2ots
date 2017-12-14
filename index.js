@@ -24,6 +24,7 @@ const DetachedTimestampFile = OpenTimestamps.DetachedTimestampFile;
 
 // Local dependecies
 const ConvertOTS = require('./libconvert.js');
+const Tools = require('./tools.js');
 
 // Parse parameters
 program
@@ -31,6 +32,7 @@ program
     .description('Convert bitcoin timestamp proof ( like Chainpoint v2 ) to OpenTimestamps proof.')
     .option('-c, --chainpoint <file>', 'Chainpoint proof')
     .option('-o, --output <file>', 'Output OTS proof')
+    .option('-n, --nobitcoin', 'Use lite-verification with insight block explorer instead local Bitcoin node')
     .parse(process.argv);
 
 const chainpointFile = program.chainpoint;
@@ -98,13 +100,13 @@ const promises = [];
 const stampsAttestations = timestamp.directlyVerified();
 stampsAttestations.forEach(subStamp => {
   subStamp.attestations.forEach(attestation => {
-    // Console.log('Find op_return: ' + ConvertOTS.bytesToHex(attestation.payload));
-    const txHash = ConvertOTS.bytesToHex(attestation.payload);
-    promises.push(ConvertOTS.resolveAttestation(txHash, subStamp));
+    // Console.log('Find op_return: ' + Tools.bytesToHex(attestation.payload));
+    const txHash = Tools.bytesToHex(attestation.payload);
+    promises.push(ConvertOTS.resolveAttestation(txHash, subStamp, program.nobitcoin));
   });
 });
 
-Promise.all(promises.map(ConvertOTS.hardFail))
+Promise.all(promises.map(Tools.hardFail))
     .then(() => {
       // Print attestations
       const attestations = timestamp.getAttestations();

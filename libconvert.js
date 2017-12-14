@@ -11,6 +11,8 @@
 const crypto = require('crypto');
 const OpenTimestamps = require('javascript-opentimestamps');
 const Insight = require('./insight.js');
+const Tools = require('./tools.js');
+const Bitcoin = require('./bitcoin.js');
 
 // OpenTimestamps shortcuts
 const Timestamp = OpenTimestamps.Timestamp;
@@ -37,16 +39,16 @@ exports.checkValidHeader = function (chainpoint) {
 
 // Migrate proofs
 exports.migrationMerkle = function (targetHash, proof) {
-  let timestamp = new Timestamp(Utils.hexToBytes(targetHash));
+  let timestamp = new Timestamp(Tools.hexToBytes(targetHash));
   const tip = timestamp;
 
   for (let i = 0; i < proof.length; i++) {
     const item = proof[i];
     let op;
     if (item.left !== undefined) {
-      op = new Ops.OpPrepend(Utils.hexToBytes(item.left));
+      op = new Ops.OpPrepend(Tools.hexToBytes(item.left));
     } else if (item.right !== undefined) {
-      op = new Ops.OpAppend(Utils.hexToBytes(item.right));
+      op = new Ops.OpAppend(Tools.hexToBytes(item.right));
     }
     timestamp = timestamp.add(op);
     const opSHA256 = new Ops.OpSHA256();
@@ -74,61 +76,107 @@ exports.migrationAttestations = function (anchors, timestamp) {
     let attestation;
     if (anchor.type === 'BTCOpReturn') {
       const tag = [0x68, 0x7F, 0xE3, 0xFE, 0x79, 0x5E, 0x9A, 0x0D];
-      attestation = new Notary.UnknownAttestation(tag, this.hexToBytes(anchor.sourceId));
+      attestation = new Notary.UnknownAttestation(tag, Tools.hexToBytes(anchor.sourceId));
       self.addAttestation(timestamp, attestation);
-
-        /* GetBlockHeight(anchor.sourceId).then((height)=>{
-            const tag = [0x05, 0x88, 0x96, 0x0d, 0x73, 0xd7, 0x19, 0x01];
-            attestation = new Notary.UnknownAttestation(tag,height);
-            addAttestation(timestamp, attestation);
-
-            // Print timestamp
-            console.log(timestamp.strTree(0,1));
-
-            // Store to file
-            saveTimestamp(otsFile, timestamp);
-
-        }).catch((err)=>{
-            console.log("Attestation error");
-        }) */
     }
   })
     ;
 };
 
+// Bitcoin node verification
+exports.nodeVerify = function () {
+  return new Promise((resolve, reject) => {
+    Bitcoin.BitcoinNode.readBitcoinConf().then(properties => {
+      const bitcoin = new Bitcoin.BitcoinNode(properties);
+      resolve(bitcoin);
+    }).catch(err => {
+      reject(err);
+    });
+  });
+};
+
+// Lite verification with Insight
+exports.liteVerify = function () {
+  return new Promise(resolve => {
+    resolve(new Insight.MultiInsight());
+  });
+};
+
 // Resolve attestation
-exports.resolveAttestation = function (txHash, timestamp) {
+exports.resolveAttestation = function (txHash, timestamp, noBitcoinNode) {
+  const self = this;
+  if (!noBitcoinNode) {
+    return new Promise((resolve, reject) => {
+      console.log('Bitcoin node verification');
+      this.nodeVerify().then(explorer => {
+        return self.verify(txHash, timestamp, explorer);
+      }).then(status => {
+        console.log('Bitcoin node verification success');
+        resolve(status);
+      }).catch(() => {
+        console.log('Bitcoin node verification failure: ');
+              // Reject('Bitcoin node verification failure: ');
+              // Fallback
+        this.liteVerify().then(explorer => {
+          console.log('Lite verification');
+          return self.verify(txHash, timestamp, explorer);
+        }).then(status => {
+          console.log('Lite verification success');
+          resolve(status);
+        }).catch(() => {
+          console.log('Lite verification failure: ');
+          reject(Error('Lite verification failure: '));
+        });
+      });
+    });
+  }
+
+  if (noBitcoinNode) {
+    return new Promise((resolve, reject) => {
+      console.log('Lite verification');
+      this.liteVerify().then(explorer => {
+        return self.verify(txHash, timestamp, explorer);
+      }).then(status => {
+        console.log('Lite verification success');
+        resolve(status);
+      }).catch(() => {
+        console.log('Lite verification failure: ');
+        reject(Error('Lite verification failure: '));
+      });
+    });
+  }
+};
+
+exports.verify = function (txHash, timestamp, explorer) {
   const self = this;
   return new Promise((resolve, reject) => {
-    const insight = new Insight.MultiInsight();
-    insight
-            .rawtx(txHash)
+    explorer.rawtx(txHash)
             .then(rawtx => {
-              const opReturn = Utils.bytesToHex(timestamp.msg);
+              const opReturn = Tools.bytesToHex(timestamp.msg);
               const pos = rawtx.indexOf(opReturn);
               if (pos === -1) {
                 throw String('Invalid tx');
               }
 
-              const append = Utils.hexToBytes(rawtx.substring(0, pos));
-              const prepend = Utils.hexToBytes(rawtx.substring(pos + txHash.length, rawtx.length));
+              const append = Tools.hexToBytes(rawtx.substring(0, pos));
+              const prepend = Tools.hexToBytes(rawtx.substring(pos + txHash.length, rawtx.length));
 
               let subStamp = timestamp.add(new Ops.OpPrepend(append));
               subStamp = subStamp.add(new Ops.OpAppend(prepend));
               subStamp = subStamp.add(new Ops.OpSHA256());
               subStamp.add(new Ops.OpSHA256());
 
-              return insight.tx(txHash);
+              return explorer.tx(txHash);
             })
             .then(tx => {
-              return insight.block(tx.blockhash);
+              return explorer.block(tx.blockhash);
             })
             .then(block => {
                 // Prepare digest tx list
               const digests = [];
               const merkleRoots = [];
               block.tx.forEach(hash => {
-                const bytes = self.hexToBytes(hash).reverse();
+                const bytes = Tools.hexToBytes(hash).reverse();
                 const digest = OpenTimestamps.DetachedTimestampFile.fromHash(new Ops.OpSHA256(), bytes);
                 merkleRoots.push(digest.timestamp);
                 digests.push(digest);
@@ -138,7 +186,7 @@ exports.resolveAttestation = function (txHash, timestamp) {
               const merkleTip = self.makeMerkleTree(merkleRoots);
               if (merkleTip === undefined) {
                 throw String('Invalid merkle tree');
-              } else if (!Utils.arrEq(merkleTip.msg, Utils.hexToBytes(block.merkleroot).reverse())) {
+              } else if (!Tools.arrEq(merkleTip.msg, Tools.hexToBytes(block.merkleroot).reverse())) {
                 throw String('Not match merkle tree');
               }
 
@@ -148,7 +196,7 @@ exports.resolveAttestation = function (txHash, timestamp) {
 
                 // Check chainpoint anchor to merge
               digests.forEach(digest => {
-                if (self.arrEq(digest.timestamp.msg, self.hexToBytes(txHash).reverse())) {
+                if (Tools.arrEq(digest.timestamp.msg, Tools.hexToBytes(txHash).reverse())) {
                   timestamp.attestations = []; // Remove unknown attestation
                   let subStamp = timestamp.ops.values().next().value;
                   subStamp = subStamp.ops.values().next().value;
@@ -157,7 +205,6 @@ exports.resolveAttestation = function (txHash, timestamp) {
                   subStamp.ops = digest.timestamp.ops;
                 }
               });
-
               resolve();
             })
             .catch(err => {
@@ -252,52 +299,8 @@ exports.calculateMerkleRoot = function (targetHash, proof) {
       left = prev;
       right = item.right;
     }
-    const result = crypto.createHash('sha256').update(this.hexToString(left)).update(this.hexToString(right)).digest('hex');
+    const result = crypto.createHash('sha256').update(Tools.hexToString(left)).update(Tools.hexToString(right)).digest('hex');
     prev = result;
   }
   return prev;
-};
-
-// Convert a hex string to a byte array
-exports.hexToBytes = function (hex) {
-  const bytes = [];
-  for (let c = 0; c < hex.length; c += 2)		{
-    bytes.push(parseInt(hex.substr(c, 2), 16));
-  }
-  return bytes;
-};
-
-// Convert a hex string to a buffer
-exports.hexToString = function (hex) {
-  return Buffer.from(hex, 'hex');
-};
-
-// Convert a byte array to a hex string
-exports.bytesToHex = function (bytes) {
-  const hex = [];
-  for (let i = 0; i < bytes.length; i++) {
-    hex.push((bytes[i] >>> 4).toString(16));
-    hex.push((bytes[i] & 0xF).toString(16));
-  }
-  return hex.join('');
-};
-
-exports.arrEq = function (arr1, arr2) {
-  return Utils.arrEq(arr1, arr2);
-};
-
-exports.hardFail = function (promise) {
-  return new Promise((resolve, reject) => {
-    promise
-            .then(resolve)
-            .catch(reject);
-  });
-};
-
-exports.softFail = function (promise) {
-  return new Promise(resolve => {
-    promise
-            .then(resolve)
-            .catch(resolve);
-  });
 };
